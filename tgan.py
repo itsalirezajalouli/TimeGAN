@@ -95,9 +95,9 @@ def TimeGAN(data, params):
         for _, X in loop:
             #   Hidden encoded latent space
             H, _ = Embedder(X).float()
-            H = torch.reshape(H, (batchSize, seqLen, dim))
+            H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
             #   Decoded to the real data
-            XHat, _ = Recovery(H).float()
+            XHat, _ = Recovery(H)
             XHat = torch.reshape(XHat, (batchSize, seqLen, dim))
             #   AutoEncoder section's loss
             AELoss = 10 * torch.sqrt(MSELoss(X, XHat))
@@ -112,3 +112,67 @@ def TimeGAN(data, params):
             loop.set_description(f'Epoch[{epoch} / {numEpochs}]')
             loop.set_postfix(loss = AELoss.item())
     print('Finished Embedding Network Training!\n')
+    print(f'{'':-<100}')
+
+    #   Training with Supervised Loss Only
+    print('Starting Training with Supervised Loss!\n')
+    for epoch in tqdm(range(numEpochs), leave = False):
+        loop = tqdm(enumerate(trainLoader), leave = False)
+        for _, X in loop:
+            #   Hidden encoded latent space
+            H, _ = Embedder(X).float()
+            H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+            #   Supervisor
+            XHatS, _ = Supervisor(H)
+            XHatS = torch.reshape(XHatS, (batchSize, seqLen, hiddenDim))
+            #   Supervisor's loss
+            SLoss = MSELoss(X[:, 1:, :], XHatS[:, :-1, :])
+
+            Embedder.zero_grad()
+            Supervisor.zero_grad()
+
+            SLoss.backward(retain_graph = True)
+
+            embdOptim.step()
+            recOptim.step()
+            loop.set_description(f'Epoch[{epoch} / {numEpochs}]')
+            loop.set_postfix(loss = SLoss.item())
+    print('Finished Supervisor Training!\n')
+    print(f'{'':-<100}')
+
+    #   Joint Training
+    print('Starting Joint Training!\n')
+    for epoch in tqdm(range(numEpochs), leave = False):
+        loop = tqdm(enumerate(trainLoader), leave = False)
+        for _, X in loop:
+            #   This inner loop is here because G, D and S are trained for an extra 2 step
+            for _ in range(2):
+                X = next(iter(trainLoader))
+
+                #   Fake stuff (Generator Training)
+                z = torch.tensor(randomNoise)
+                z = z.float()
+
+                fake, _ = Generator(z)
+                fake = torch.reshape(fake, (batchSize, seqLen, hiddenDim))
+                
+                hHat, _ = Supervisor(fake)
+                hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
+
+                yFake = Discriminator(fake)
+                yFake = torch.reshape(yFake, (batchSize, seqLen, 1))
+
+                xHat = Recovery(hHat)
+                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
+
+                #   Reality stuff
+                H, _ = Embedder(X)
+                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+
+                hHatS = Supervisor(H)
+                hHatS = torch.reshape(hHatS, (batchSize, seqLen, hiddenDim))
+                
+                Generator.zero_grad()
+                Supervisor.zero_grad()
+                Discriminator.zero_grad()
+                Recovery.zero_grad()
