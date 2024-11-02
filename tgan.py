@@ -159,13 +159,13 @@ def TimeGAN(data, params):
                 hHat, _ = Supervisor(fake)
                 hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
 
-                yFake = Discriminator(fake)
-                yFake = torch.reshape(yFake, (batchSize, seqLen, 1))
-
                 xHat = Recovery(hHat)
                 xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
 
-                #   Reality stuff
+                yFake = Discriminator(fake)
+                yFake = torch.reshape(yFake, (batchSize, seqLen, 1))
+
+                #   Real stuff
                 H, _ = Embedder(X)
                 H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
 
@@ -176,3 +176,9 @@ def TimeGAN(data, params):
                 Supervisor.zero_grad()
                 Discriminator.zero_grad()
                 Recovery.zero_grad()
+
+                #   Loss between real data & Supervisor(H)
+                GSLoss = MSELoss(H[:, 1:, :], hHatS[:, :-1, :])
+
+                BCELoss = nn.BCEWithLogitsLoss()
+                GULoss = BCELoss(yFake, torch.ones_like(yFake))
