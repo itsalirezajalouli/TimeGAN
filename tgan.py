@@ -1,4 +1,5 @@
 #   Imports and device
+from sqlalchemy.sql.elements import AnnotatedColumnElement
 import torch
 import numpy as np
 import pandas as pd
@@ -146,10 +147,10 @@ def TimeGAN(data, params):
         loop = tqdm(enumerate(trainLoader), leave = False)
         for _, X in loop:
             #   This inner loop is here because G, D and S are trained for an extra 2 step
+            #   Generator Training
             for _ in range(2):
                 X = next(iter(trainLoader))
-
-                #   Fake stuff (Generator Training)
+                #   Fake stuff
                 z = torch.tensor(randomNoise)
                 z = z.float()
 
@@ -182,3 +183,76 @@ def TimeGAN(data, params):
 
                 BCELoss = nn.BCEWithLogitsLoss()
                 GULoss = BCELoss(yFake, torch.ones_like(yFake))
+
+                GLossV1 = torch.mean(torch.abs((torch.std(xHat, [0],
+                        unbiased = false)) + 1e-6 - (torch.std(X, [0]) + 1e-6)))
+                GLossV2 = torch.mean(torch.abs((torch.mean(xHat, [0]) - (torch.mean(xHat, [0])))))
+                GLossV = GLossV1 + GLossV2
+
+                GSLoss.backward(retain_graph = True)
+                GULoss.backward(retain_graph = True)
+                GLossV.backward(retain_graph = True)
+
+                genOptim.step()
+                supOptim.step()
+                disOptim.step()
+
+                #   Training Embedder (how well AutoEncoder works?)
+                MSELoss = nn.MSELoss()
+
+                H, _ = Embedder(X).float()
+                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+
+                xHat = Recovery(hHat)
+                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
+
+                AELossT0 = MSELoss(X, xHat)
+                AELoss0 = 10 * torch.sqrt(MSELoss(X, xHat))
+
+                hHatS, _ = Supervisor(H)               
+                hHatS = torch.reshape(hHatS, (batchSize, seqLen, hiddenDim))
+
+                GSLoss = MSELoss(H[:, 1:, :], hHatS[:, :-1, :])
+                AELoss = AELoss0 + 0.1 * GSLoss
+
+                GSLoss.backward(retain_graph = True)
+                AELossT0.backward()
+
+                Recovery.zero_grad()
+                Embedder.zero_grad()
+                Supervisor.zero_grad()
+
+                embdOptim.step()
+                recOptim.step()
+                supOptim.step()
+
+            for _, X in enumerate(trainLoader):
+                z = torch.tensor(randomNoise)
+                z = z.float()
+
+                H, _ = Embedder(X)
+                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+
+                yReal, _ = Discriminator(H)
+                yReal = torch.reshape(yReal, (batchSize, seqLen, hiddenDim))
+
+                fake, _ = Generator(z)
+                fake = torch.reshape(fake, (batchSize, seqLen, hiddenDim))
+
+                yFakeEmbd, _ = Discriminator(fake)
+                yFakeEmbd = torch.reshape(yFakeEmbd, (batchSize, seqLen, hiddenDim))
+                
+                hHat, _ = Supervisor(fake)
+                hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
+                
+                yFake, _ = Discriminator(fake)
+                yFake = torch.reshape(yFake, (batchSize, seqLen, hiddenDim))
+
+                xHat, _ = Recovery(hHat)
+                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
+
+                Generator.zero_grad()
+                Supervisor.zero_grad()
+                Discriminator.zero_grad()
+                Recovery.zero_grad()
+                Embedder.zero_grad()
