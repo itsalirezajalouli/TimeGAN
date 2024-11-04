@@ -1,65 +1,123 @@
-#   Imports and device
-from sqlalchemy.sql.elements import AnnotatedColumnElement
+# Imports and device
 import torch
 import numpy as np
 import pandas as pd
-from torch.nn.modules import rnn
 from tqdm import tqdm
 import torch.nn as nn
-import seaborn as sns
+from copy import deepcopy
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, Dataset
 
-#   Device
+# Device
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-#   TimeGAN
-class TimeGANModule(nn.Module):
-    def __init__(self, inputSize, outputSize, hiddenDim, nLayers,
-                 activationFunc = torch.sigmoid, rnnType = 'GRU') -> None:
-        super(TimeGANModule, self).__init__()
-        #   Params
-        self.inputSize = inputSize
-        self.outputSize = outputSize
-        self.hiddenDim = hiddenDim
-        self.actFunc = activationFunc
-        self.rnnType = rnnType
-        self.nLayers = nLayers
-        #   RNN Layer
-        match rnnType:
-            case 'RNN':
-                self.rnn = nn.RNN(inputSize, hiddenDim, nLayers, batch_first = True)
-            case 'LSTM':
-                self.rnn = nn.LSTM(inputSize, hiddenDim, nLayers, batch_first = True)
-            case 'GRU':
-                self.rnn = nn.GRU(inputSize, hiddenDim, nLayers, batch_first = True)
-        #   FC Layer 
-        self.fc = nn.Linear(hiddenDim, outputSize)
+# Data
+data = pd.read_csv('./AMZN.csv')
+data = data[['Date', 'Close']]
+data['Date'] = pd.to_datetime(data['Date'])
 
-    def forward(self, X):
-        batchSize = X.size(0)
-        if self.rnnType == 'LSTM':
-            #   Hidden State & Cell State
-            h0 = torch.zeros(2 * self.nStacked, batchSize, self.hiddenDim).to(device).float()
-            c0 = torch.zeros(2 * self.nStacked, batchSize, self.hiddenDim).to(device).float()
+# Lookback function
+def lookback(df, nsteps: int, label: str) -> pd.DataFrame:
+    df = deepcopy(df)
+    df.set_index('Date', inplace=True)
+    for i in range(1, nsteps + 1):
+        df[f'{label}(t-{i})'] = df[label].shift(i)
+    # Drop NaNs
+    df.dropna(inplace=True)
+    return df
+
+hist = 7
+newdata = lookback(data, hist, 'Close')
+npdata = newdata.to_numpy()
+
+# Scale
+scaler = MinMaxScaler(feature_range=(-1, 1))
+npdata = scaler.fit_transform(npdata)
+
+# Features & targets
+x = npdata[:, 1:]
+x = deepcopy(np.flip(x, axis=1))  # LSTM processes from oldest to latest summary
+y = npdata[:, 0]  # Starting from -7 to -1
+
+# Split
+splitidx = int(len(x) * 0.95)
+xtrain = x[:splitidx]
+xtest = x[splitidx:]
+ytrain = y[:splitidx]
+ytest = y[splitidx:]
+
+# PyTorch LSTM requires an extra dimension
+xtrain = xtrain.reshape((-1, hist, 1))
+xtest = xtest.reshape((-1, hist, 1))
+ytrain = ytrain.reshape((-1, 1))
+ytest = ytest.reshape((-1, 1))
+
+# Move to torch tensors
+xtrain = torch.tensor(xtrain).float()
+xtest = torch.tensor(xtest).float()
+ytrain = torch.tensor(ytrain).float()
+ytest = torch.tensor(ytest).float()
+
+# Dataset & loader
+class TimeSeriesDataset(Dataset):
+    def __init__(self, x, y) -> None:
+        self.x = x
+        self.y = y
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.x[i], self.y[i]
+
+trainset = TimeSeriesDataset(xtrain, ytrain)
+testset = TimeSeriesDataset(xtest, ytest)
+
+class TimeGANModule(nn.Module):
+    def __init__(self, input_size, output_size, hidden_dim, n_layers,
+                 activation_func=torch.sigmoid, rnn_type='gru') -> None:
+        super(TimeGANModule, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_dim = hidden_dim
+        self.act_func = activation_func
+        self.rnn_type = rnn_type
+        self.n_layers = n_layers
+
+        # RNN layer
+        if rnn_type == 'rnn':
+            self.rnn = nn.RNN(input_size, hidden_dim, n_layers, batch_first=True)
+        elif rnn_type == 'lstm':
+            self.rnn = nn.LSTM(input_size, hidden_dim, n_layers, batch_first=True)
+        elif rnn_type == 'gru':
+            self.rnn = nn.GRU(input_size, hidden_dim, n_layers, batch_first=True)
+
+        # Fully connected layer
+        self.fc = nn.Linear(hidden_dim, output_size)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        if self.rnn_type == 'lstm':
+            h0 = torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(device)
+            c0 = torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(device)
             hidden = (h0, c0)
         else:
-            hidden = torch.zeros(self.nStacked, batchSize, self.hiddenDim).to(device).float()
-        out, hidden = self.rnn(X, hidden)
+            hidden = torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(device)
 
-        out = out.contiguous().view(-1, self.hiddenDim)
+        out, hidden = self.rnn(x, hidden)
+        out = out.contiguous().view(-1, self.hidden_dim)
         out = self.fc(out)
 
-        if self.actFunc == self.Identity:
-            identity = nn.Identity()
-            return identity(out)
+        if self.act_func == nn.Identity():
+            return out
 
-        out = self.actFunc(out)
+        out = self.act_func(out)
         return out, hidden
 
 def TimeGAN(data, params):
-    #   Params
+    # Params
     hiddenDim = params['hiddenDim']
     nLayer = params['nLayers']
     iters = params['iters']
@@ -71,102 +129,99 @@ def TimeGAN(data, params):
     gamma = 1
     checkPoints = {}
 
-    #   Models
+    # Models
     Embedder = TimeGANModule(zDim, hiddenDim, hiddenDim, nLayer)
     Recovery = TimeGANModule(hiddenDim, dim, hiddenDim, nLayer)
     Generator = TimeGANModule(dim, hiddenDim, hiddenDim, nLayer)
     Supervisor = TimeGANModule(hiddenDim, hiddenDim, hiddenDim, nLayer)
     Discriminator = TimeGANModule(hiddenDim, 1, hiddenDim, nLayer, nn.Identity)
 
-    #   Optimizers
-    embdOptim = optim.Adam(Embedder.parameters(), lr = 0.001)
-    recOptim = optim.Adam(Recovery.parameters(), lr = 0.001)
-    genOptim = optim.Adam(Generator.parameters(), lr = 0.001)
-    supOptim = optim.Adam(Supervisor.parameters(), lr = 0.001)
-    disOptim = optim.Adam(Discriminator.parameters(), lr = 0.001)
+    # Optimizers
+    embdOptim = optim.Adam(Embedder.parameters(), lr=0.001)
+    recOptim = optim.Adam(Recovery.parameters(), lr=0.001)
+    genOptim = optim.Adam(Generator.parameters(), lr=0.001)
+    supOptim = optim.Adam(Supervisor.parameters(), lr=0.001)
+    disOptim = optim.Adam(Discriminator.parameters(), lr=0.001)
     BCELoss = nn.BCEWithLogitsLoss()
     MSELoss = nn.MSELoss()
-    trainLoader = DataLoader(data, params['batchSize'], shuffle = True)
-    randomNoise = torch.randn(())
+    #   If drop last is false embedding gets error
+    trainLoader = DataLoader(data, params['batchSize'], shuffle=True, drop_last = True)
 
-    #   Embedding Network Training (AutoEncoder / Embedder + Recovery Training)
-    print('Started Embedding Network Training!\n')
-    for epoch in tqdm(range(numEpochs), leave = False):
-        loop = tqdm(enumerate(trainLoader), leave = False)
+    # Embedding Network Training (AutoEncoder / Embedder + Recovery Training)
+    print('Started Embedding Network Training!')
+    for epoch in tqdm(range(numEpochs), leave=False):
+        loop = tqdm(enumerate(trainLoader), leave=False)
         for _, X in loop:
-            #   Hidden encoded latent space
-            H, _ = Embedder(X).float()
+            # Hidden encoded latent space
+            H, _ = Embedder(X)
             H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
-            #   Decoded to the real data
+            # Decoded to the real data
             XHat, _ = Recovery(H)
             XHat = torch.reshape(XHat, (batchSize, seqLen, dim))
-            #   AutoEncoder section's loss
+            # AutoEncoder section's loss
             AELoss = 10 * torch.sqrt(MSELoss(X, XHat))
 
             Embedder.zero_grad()
             Recovery.zero_grad()
 
-            AELoss.backward(retain_graph = True)
+            AELoss.backward(retain_graph=True)
 
             embdOptim.step()
             recOptim.step()
             loop.set_description(f'Epoch[{epoch} / {numEpochs}]')
-            loop.set_postfix(loss = AELoss.item())
-    print('Finished Embedding Network Training!\n')
+            loop.set_postfix(loss=AELoss.item())
+    print('Finished Embedding Network Training!')
     print(f'{'':-<100}')
 
-    #   Training with Supervised Loss Only
-    print('Starting Training with Supervised Loss!\n')
-    for epoch in tqdm(range(numEpochs), leave = False):
-        loop = tqdm(enumerate(trainLoader), leave = False)
+    # Training with Supervised Loss Only
+    print('Starting Training with Supervised Loss!')
+    for epoch in tqdm(range(numEpochs), leave=False):
+        loop = tqdm(enumerate(trainLoader), leave=False)
         for _, X in loop:
-            #   Hidden encoded latent space
-            H, _ = Embedder(X).float()
+            # Hidden encoded latent space
+            H, _ = Embedder(X)
             H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
-            #   Supervisor
+            # Supervisor
             XHatS, _ = Supervisor(H)
             XHatS = torch.reshape(XHatS, (batchSize, seqLen, hiddenDim))
-            #   Supervisor's loss
+            # Supervisor's loss
             SLoss = MSELoss(X[:, 1:, :], XHatS[:, :-1, :])
 
             Embedder.zero_grad()
             Supervisor.zero_grad()
 
-            SLoss.backward(retain_graph = True)
+            SLoss.backward(retain_graph=True)
 
             embdOptim.step()
             recOptim.step()
             loop.set_description(f'Epoch[{epoch} / {numEpochs}]')
-            loop.set_postfix(loss = SLoss.item())
-    print('Finished Supervisor Training!\n')
+            loop.set_postfix(loss=SLoss.item())
+    print('Finished Supervisor Training!')
     print(f'{'':-<100}')
 
-    #   Joint Training
-    print('Starting Joint Training!\n')
-    for epoch in tqdm(range(numEpochs), leave = False):
-        loop = tqdm(enumerate(trainLoader), leave = False)
+    # Joint Training
+    print('Starting Joint Training!')
+    for epoch in tqdm(range(numEpochs), leave=False):
+        loop = tqdm(enumerate(trainLoader), leave=False)
         for _, X in loop:
-            #   This inner loop is here because G, D and S are trained for an extra 2 step
-            #   Generator Training
+            # This inner loop is here because G, D and S are trained for an extra 2 step
+            # Generator Training
             for _ in range(2):
-                X = next(iter(trainLoader))
-                #   Fake stuff
-                z = torch.tensor(randomNoise)
-                z = z.float()
-
+                z = torch.randn(batchSize, seqLen, dim).to(device)
+                # Fake stuff
                 fake, _ = Generator(z)
                 fake = torch.reshape(fake, (batchSize, seqLen, hiddenDim))
                 
                 hHat, _ = Supervisor(fake)
                 hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
 
-                xHat = Recovery(hHat)
+                xHat, _ = Recovery(hHat)
                 xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
 
-                yFake = Discriminator(fake)
+                yFake, _ = Discriminator(fake)
                 yFake = torch.reshape(yFake, (batchSize, seqLen, 1))
 
-                #   Real stuff
+                # Real stuff
                 H, _ = Embedder(X)
                 H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
 
@@ -178,28 +233,25 @@ def TimeGAN(data, params):
                 Discriminator.zero_grad()
                 Recovery.zero_grad()
 
-                #   Loss between real data & Supervisor(H)
+                # Loss between real data & Supervisor(H)
                 GSLoss = MSELoss(H[:, 1:, :], hHatS[:, :-1, :])
 
-                BCELoss = nn.BCEWithLogitsLoss()
                 GULoss = BCELoss(yFake, torch.ones_like(yFake))
 
                 GLossV1 = torch.mean(torch.abs((torch.std(xHat, [0],
-                        unbiased = false)) + 1e-6 - (torch.std(X, [0]) + 1e-6)))
+                        unbiased=False)) + 1e-6 - (torch.std(X, [0]) + 1e-6)))
                 GLossV2 = torch.mean(torch.abs((torch.mean(xHat, [0]) - (torch.mean(xHat, [0])))))
                 GLossV = GLossV1 + GLossV2
 
-                GSLoss.backward(retain_graph = True)
-                GULoss.backward(retain_graph = True)
-                GLossV.backward(retain_graph = True)
+                GSLoss.backward(retain_graph=True)
+                GULoss.backward(retain_graph=True)
+                GLossV.backward(retain_graph=True)
 
                 genOptim.step()
                 supOptim.step()
                 disOptim.step()
 
-                #   Training Embedder (how well AutoEncoder works?)
-                MSELoss = nn.MSELoss()
-
+                # Training Embedder (how well AutoEncoder works?)
                 H, _ = Embedder(X).float()
                 H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
 
@@ -215,7 +267,7 @@ def TimeGAN(data, params):
                 GSLoss = MSELoss(H[:, 1:, :], hHatS[:, :-1, :])
                 AELoss = AELoss0 + 0.1 * GSLoss
 
-                GSLoss.backward(retain_graph = True)
+                GSLoss.backward(retain_graph=True)
                 AELossT0.backward()
 
                 Recovery.zero_grad()
@@ -226,106 +278,64 @@ def TimeGAN(data, params):
                 recOptim.step()
                 supOptim.step()
 
-            for _, X in enumerate(trainLoader):
-                z = torch.tensor(randomNoise)
-                z = z.float()
+        # Test step
+        with torch.no_grad():
+            # Generate fake samples
+            z = torch.randn(batchSize, seqLen, dim).to(device)
+            fake, _ = Generator(z)
+            fake = torch.reshape(fake, (batchSize, seqLen, dim))
 
-                H, _ = Embedder(X)
-                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+            # Reconstruct real samples
+            real = next(iter(trainLoader))
+            H, _ = Embedder(real)
+            H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
+            xHat, _ = Recovery(H)
+            xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
 
-                yReal, _ = Discriminator(H)
-                yReal = torch.reshape(yReal, (batchSize, seqLen, hiddenDim))
+            # Calculate test losses
+            testAELoss = MSELoss(real, xHat)
+            testGLoss = MSELoss(real, fake)
 
-                fake, _ = Generator(z)
-                fake = torch.reshape(fake, (batchSize, seqLen, hiddenDim))
+        with torch.no_grad():
+            z = torch.randn(xtrain.shape[0], xtrain.shape[1], xtrain.shape[2]).to(device)
+            generated_data, _ = Generator(z)
+            generated_data = generated_data.cpu().numpy()
 
-                yFakeEmbd, _ = Discriminator(fake)
-                yFakeEmbd = torch.reshape(yFakeEmbd, (batchSize, seqLen, 1))
-                
-                hHat, _ = Supervisor(fake)
-                hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
-                
-                yFake, _ = Discriminator(fake)
-                yFake = torch.reshape(yFake, (batchSize, seqLen, hiddenDim))
+            original_data = xtrain.cpu().numpy()  # Original training data for comparison
 
-                xHat, _ = Recovery(hHat)
-                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
+            # Plot original and generated data
+            plt.figure(figsize=(14, 6))
+            for i in range(min(len(original_data), 3)):  # Plot up to 3 examples for better visualization
+                plt.subplot(3, 2, i*2 + 1)
+                plt.plot(original_data[i].squeeze(), label='Original')
+                plt.title(f'Original Data {i+1}')
+                plt.xlabel('Time Steps')
+                plt.ylabel('Values')
 
-                Generator.zero_grad()
-                Supervisor.zero_grad()
-                Discriminator.zero_grad()
-                Recovery.zero_grad()
-                Embedder.zero_grad()
+                plt.subplot(3, 2, i*2 + 2)
+                plt.plot(generated_data[i].squeeze(), label='Generated', color='orange')
+                plt.title(f'Generated Data {i+1}')
+                plt.xlabel('Time Steps')
+                plt.ylabel('Values')
 
-                DRealLoss = nn.BCEWithLogitsLoss()
-                DRL = DRealLoss(yReal,torch.ones_like(yReal))
+                plt.tight_layout()
+                plt.show()
 
-                DFakeLoss = nn.BCEWithLogitsLoss()
-                DFL = DFakeLoss(yFake,torch.ones_like(yFake))
+            print(f"Epoch [{epoch}/{numEpochs}] - Test AE Loss: {testAELoss.item()}, Test G Loss: {testGLoss.item()}")
 
-                DFakeLossEmbd = nn.BCEWithLogitsLoss()
-                DFLE = DFakeLossEmbd(yFakeEmbd, torch.ones_like((yFakeEmbd)))
+    print('Finished Join Training!')
+    print(f'{'':-<100}')
+# Generate and plot predictions next to original data at the end of training
 
-                DLoss = DRL + DFL + gamma * DFLE
+# Parameters for the TimeGAN function
+params = {
+    'hiddenDim': 32,
+    'nLayers': 2,
+    'iters': 1000,
+    'batchSize': 32,
+    'module': 'gru',
+    'numEpochs': 1
+}
 
-                if DLoss > 0.15: 
-                    DLoss.backward(retain_graph = True)
-                    disOptim.step()
-
-                H, _ = Embedder(X)
-                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
-
-                xHat, _ = Recovery(hHat)
-                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
-
-                z = torch.tensor(randomNoise)
-                z = z.float()
-
-                fake, _ = Generator(z)
-                fake = torch.reshape(fake, (batchSize, seqLen, hiddenDim))
-
-                hHat, _ = Supervisor(fake)
-                hHat = torch.reshape(hHat, (batchSize, seqLen, hiddenDim))
-
-                yFake, _ = Discriminator(fake)
-                yFake = torch.reshape(yFake, (batchSize, seqLen, 1))
-
-                xHat, _ = Recovery(hHat)
-                xHat = torch.reshape(xHat, (batchSize, seqLen, dim))
-
-                H, _ = Embedder(X.float())
-                H = torch.reshape(H, (batchSize, seqLen, hiddenDim))
-
-                hHatS = Supervisor(H)
-                hHatS = torch.reshape(hHatS, (batchSize, seqLen, hiddenDim))
-
-                GSLoss = MSELoss(H[:, 1:, :], hHatS[:, :-1, :])
-                BCELoss = nn.BCEWithLogitsLoss()
-                GULoss = BCELoss(yFake, torch.ones_like(yFake))
-                GLossV1 = torch.mean(torch.abs((torch.std(xHat, [0],
-                        unbiased = false)) + 1e-6 - (torch.std(X, [0]) + 1e-6)))
-                GLossV2 = torch.mean(torch.abs((torch.mean(xHat, [0]) - (torch.mean(xHat, [0])))))
-                GLossV = GLossV1 + GLossV2
-
-                AELossT0 = MSELoss(X, xHat)
-                AELoss0 = 10 * torch.sqrt(MSELoss(X, xHat))
-                AELoss = AELoss0 + 0.1 * GSLoss
-
-                GSLoss.backward(retain_graph = True)
-                GULoss.backward(retain_graph = True)
-                GLossV.backward(retain_graph = True)
-                AELoss.backward()
-
-                genOptim.step()
-                supOptim.step()
-                embdOptim.step()
-                recOptim.step()
-
-                loop.set_description(f'Epoch[{epoch} / {numEpochs}]')
-                loop.set_postfix(DLoss = DLoss.item(), GULoss = GULoss.item(),
-                    GSLoss = GSLoss.item(), AELoss0 = AELoss0.item()
-                                 )
-        print('Finished Join Training!\n')
-        print(f'{'':-<100}')
-
-        randomTest = torch.randn(())
+# Call the TimeGAN function to start training
+TimeGAN(xtrain, params)
